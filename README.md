@@ -1,6 +1,6 @@
 # pgfs
 
-[![GoDoc reference](https://img.shields.io/badge/godoc-reference-blue.svg)](https://pkg.go.dev/mz.attahri.com/pgfs)
+[![GoDoc reference](https://img.shields.io/badge/godoc-reference-blue.svg)](https://pkg.go.dev/mz.attahri.com/pgfs/v2)
 ![CI](https://github.com/mzattahri/pgfs/actions/workflows/ci.yml/badge.svg)
 [![Coverage Status](https://coveralls.io/repos/github/mzattahri/pgfs/badge.svg)](https://coveralls.io/github/mzattahri/pgfs)
 [![Go Report Card](https://goreportcard.com/badge/mz.attahri.com/pgfs)](https://goreportcard.com/report/mz.attahri.com/pgfs)
