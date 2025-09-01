@@ -11,12 +11,12 @@ Postgres.
 
 ## Documentation
 
-See [documentation](https://pkg.go.dev/mz.attahri.com/pgfs) for more details.
+See [documentation](https://pkg.go.dev/mz.attahri.com/pgfs/v2) for more details.
 
 ## Installation
 
 ```shell
-go get mz.attahri.com/pgfs
+go get mz.attahri.com/pgfs/v2
 ```
 
 ## Testing
