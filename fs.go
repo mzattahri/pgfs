@@ -131,7 +131,11 @@ func (fsys *FS) ReadFile(name string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() {
+		if err := f.Close(); err != nil {
+			slog.Error("error closing file", "name", name, "err", err)
+		}
+	}()
 	return io.ReadAll(f)
 }
 
@@ -156,7 +160,11 @@ func (fsys *FS) ReadDir(name string) ([]fs.DirEntry, error) {
 	}
 
 	entries := make([]fs.DirEntry, 0)
-	defer rows.Close()
+	defer func() {
+		if err := rows.Close(); err != nil {
+			slog.Error("error closing rows", "dir", name, "err", err)
+		}
+	}()
 	for rows.Next() {
 		e := &entry{}
 		err := rows.Scan(

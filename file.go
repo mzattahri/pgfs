@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -106,7 +107,11 @@ func (d *dir) Readdir(n int) (entries []fs.FileInfo, err error) {
 		return
 	}
 
-	defer rows.Close()
+	defer func() {
+		if err := rows.Close(); err != nil {
+			slog.Error("error closing rows", "err", err)
+		}
+	}()
 	for rows.Next() {
 		e := &entry{
 			mode: 0,
