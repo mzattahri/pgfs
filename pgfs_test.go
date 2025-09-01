@@ -21,7 +21,7 @@ import (
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib" // Postgres driver
-	"mz.attahri.com/pgfs"
+	"mz.attahri.com/pgfs/v2"
 )
 
 var TestDB *sql.DB
