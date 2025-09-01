@@ -7,7 +7,7 @@ import (
 	"log"
 	"os"
 
-	"mz.attahri.com/pgfs/v2"
+	"mz.attahri.com/code/pgfs/v2"
 )
 
 var db *sql.DB

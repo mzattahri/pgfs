@@ -1,4 +1,4 @@
-module mz.attahri.com/pgfs/v2
+module mz.attahri.com/code/pgfs/v2
 
 go 1.23.0
 
