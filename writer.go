@@ -3,6 +3,7 @@ package pgfs
 import (
 	"hash"
 	"io/fs"
+	"log/slog"
 	"math"
 	"net/http"
 
@@ -50,8 +51,15 @@ func (w *writer) Write(b []byte) (n int, err error) {
 // Close implements [io.WriteCloser].
 func (w *writer) Close() error {
 	if w.closed {
-		return fs.ErrClosed
+		return nil
 	}
+
+	defer func() {
+		if err := close(w.fsys.conn, w.fd); err != nil {
+			slog.Error("error closing lo", "id", w.id, "err", err)
+		}
+		w.closed = true
+	}()
 
 	if w.contentType == "" {
 		w.contentType = http.DetectContentType(w.tag)
@@ -67,13 +75,12 @@ func (w *writer) Close() error {
 			$4, $5, $6
 		)
   `
-	if _, err := w.fsys.conn.Exec(q, w.oid, w.id, w.sys, w.size, w.contentType, w.hasher.Sum(nil)); err != nil {
+	_, err := w.fsys.conn.Exec(q, w.oid, w.id, w.sys, w.size, w.contentType, w.hasher.Sum(nil))
+	if err != nil {
+		if uerr := unlink(w.fsys.conn, w.oid); uerr != nil {
+			slog.Error("error unlinking lo after insert error", "id", w.id, "oid", w.oid, "err", uerr)
+		}
 		return err
 	}
-	if err := close(w.fsys.conn, w.fd); err != nil {
-		return err
-	}
-
-	w.closed = true
 	return nil
 }

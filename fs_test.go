@@ -1,3 +1,4 @@
+// nolint
 package pgfs_test
 
 import (
@@ -6,7 +7,7 @@ import (
 	"log"
 	"os"
 
-	"mohamed.attahri.com/pgfs"
+	"mz.attahri.com/pgfs"
 )
 
 var db *sql.DB

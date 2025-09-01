@@ -1,4 +1,5 @@
-package pgfs
+// nolint
+package pgfs_test
 
 import (
 	"bytes"
@@ -11,16 +12,16 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"maps"
 	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"sort"
 	"testing"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib" // Postgres driver
-	"golang.org/x/exp/maps"
+	"mz.attahri.com/pgfs"
 )
 
 var TestDB *sql.DB
@@ -81,7 +82,7 @@ func migrate(db *sql.DB) error {
 	}
 	defer tx.Rollback()
 
-	if err := MigrateUp(tx); err != nil {
+	if err := pgfs.MigrateUp(tx); err != nil {
 		return err
 	}
 
@@ -95,14 +96,14 @@ func reset(db *sql.DB) error {
 	}
 	defer tx.Rollback()
 
-	if err := MigrateDown(tx); err != nil {
+	if err := pgfs.MigrateDown(tx); err != nil {
 		return err
 	}
 
 	return tx.Commit()
 }
 
-func withFS(t *testing.T, fn func(fsys *FS)) {
+func withFS(t *testing.T, fn func(fsys *pgfs.FS)) {
 	t.Helper()
 
 	tx, err := TestDB.Begin()
@@ -115,14 +116,10 @@ func withFS(t *testing.T, fn func(fsys *FS)) {
 		}
 	})
 
-	fn(New(tx))
-
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
-	}
+	fn(pgfs.New(tx))
 }
 
-func createFile(t *testing.T, fsys *FS, name, contentType string, sys Sys) {
+func createFile(t *testing.T, fsys *pgfs.FS, name, contentType string, sys pgfs.Sys) {
 	t.Helper()
 
 	w, err := fsys.Create(name, contentType, sys)
@@ -139,26 +136,26 @@ func createFile(t *testing.T, fsys *FS, name, contentType string, sys Sys) {
 
 func TestValidPath(t *testing.T) {
 	testCases := map[string]bool{
-		GenerateUUID():          true,
-		"":                      true,
-		"hello":                 false,
-		"12345":                 false,
-		GenerateUUID() + "1234": false,
+		pgfs.GenerateUUID():          true,
+		"":                           true,
+		"hello":                      false,
+		"12345":                      false,
+		pgfs.GenerateUUID() + "1234": false,
 	}
 
 	for name, wanted := range testCases {
-		if got := ValidPath(name); wanted != got {
+		if got := pgfs.ValidPath(name); wanted != got {
 			t.Error("Name:", name, "Wanted:", wanted, "Got:", got)
 		}
 	}
 }
 
 func TestFSStat(t *testing.T) {
-	withFS(t, func(fsys *FS) {
+	withFS(t, func(fsys *pgfs.FS) {
 		var (
-			name        = GenerateUUID()
+			name        = pgfs.GenerateUUID()
 			contentType = "image/png"
-			sys         = Sys{
+			sys         = pgfs.Sys{
 				"a": "1",
 				"b": "2",
 				"c": "3",
@@ -187,12 +184,12 @@ func TestFSStat(t *testing.T) {
 			t.Error("file should be regular")
 		}
 
-		fi, ok := info.(FileInfo)
+		fi, ok := info.(pgfs.FileInfo)
 		if !ok {
 			t.Fatal("info.Sys is not of type *Sys")
 		}
 
-		m, ok := fi.Sys().(Sys)
+		m, ok := fi.Sys().(pgfs.Sys)
 		if !ok {
 			t.Error("not of type Sys")
 		}
@@ -213,9 +210,9 @@ func TestFSStat(t *testing.T) {
 }
 
 func TestFileRead(t *testing.T) {
-	withFS(t, func(fsys *FS) {
-		name := GenerateUUID()
-		createFile(t, fsys, name, BinaryType, nil)
+	withFS(t, func(fsys *pgfs.FS) {
+		name := pgfs.GenerateUUID()
+		createFile(t, fsys, name, pgfs.BinaryType, nil)
 
 		f, err := fsys.Open(name)
 		if err != nil {
@@ -236,9 +233,9 @@ func TestFileRead(t *testing.T) {
 }
 
 func TestFileSeek(t *testing.T) {
-	withFS(t, func(fsys *FS) {
-		name := GenerateUUID()
-		createFile(t, fsys, name, BinaryType, nil)
+	withFS(t, func(fsys *pgfs.FS) {
+		name := pgfs.GenerateUUID()
+		createFile(t, fsys, name, pgfs.BinaryType, nil)
 
 		f, err := fsys.Open(name)
 		if err != nil {
@@ -292,9 +289,9 @@ func TestFileSeek(t *testing.T) {
 }
 
 func TestReadFile(t *testing.T) {
-	withFS(t, func(fsys *FS) {
-		name := GenerateUUID()
-		createFile(t, fsys, name, BinaryType, nil)
+	withFS(t, func(fsys *pgfs.FS) {
+		name := pgfs.GenerateUUID()
+		createFile(t, fsys, name, pgfs.BinaryType, nil)
 
 		b, err := fsys.ReadFile(name)
 		if err != nil {
@@ -308,7 +305,7 @@ func TestReadFile(t *testing.T) {
 }
 
 func TestFSOpenBadName(t *testing.T) {
-	withFS(t, func(fsys *FS) {
+	withFS(t, func(fsys *pgfs.FS) {
 		_, err := fsys.Open("bad name")
 		if err != fs.ErrNotExist {
 			t.Fatal("expected fs.ErrNotExist", err)
@@ -317,8 +314,8 @@ func TestFSOpenBadName(t *testing.T) {
 }
 
 func TestFSRemoveNotExist(t *testing.T) {
-	withFS(t, func(fsys *FS) {
-		err := fsys.Remove(GenerateUUID())
+	withFS(t, func(fsys *pgfs.FS) {
+		err := fsys.Remove(pgfs.GenerateUUID())
 		if err != fs.ErrNotExist {
 			t.Fatal("expected fs.ErrNotExist", err)
 		}
@@ -326,7 +323,7 @@ func TestFSRemoveNotExist(t *testing.T) {
 }
 
 func TestFSReaddir(t *testing.T) {
-	withFS(t, func(fsys *FS) {
+	withFS(t, func(fsys *pgfs.FS) {
 		wanted := make([]string, 0)
 		if result, err := fsys.ReadDir(""); err != nil {
 			t.Fatal(err)
@@ -338,9 +335,9 @@ func TestFSReaddir(t *testing.T) {
 
 		const more = 100
 		for i := 0; i < more; i++ {
-			name := GenerateUUID()
+			name := pgfs.GenerateUUID()
 			wanted = append(wanted, name)
-			createFile(t, fsys, name, BinaryType, nil)
+			createFile(t, fsys, name, pgfs.BinaryType, nil)
 		}
 
 		got, err := fsys.ReadDir("")
@@ -352,9 +349,6 @@ func TestFSReaddir(t *testing.T) {
 			t.Fatal("number of files don't match", "Wanted", len(wanted), "Got", len(got))
 		}
 
-		// Sort by id ASC.
-		sort.Strings(sort.StringSlice(wanted))
-
 		for i, item := range got {
 			if item.Name() != wanted[i] {
 				t.Fatal("item", i, "don't match", "Wanted", wanted[i], "Got", item.Name())
@@ -364,9 +358,9 @@ func TestFSReaddir(t *testing.T) {
 }
 
 func TestFSRemove(t *testing.T) {
-	withFS(t, func(fsys *FS) {
-		name := GenerateUUID()
-		createFile(t, fsys, name, BinaryType, nil)
+	withFS(t, func(fsys *pgfs.FS) {
+		name := pgfs.GenerateUUID()
+		createFile(t, fsys, name, pgfs.BinaryType, nil)
 
 		if err := fsys.Remove(name); err != nil {
 			t.Fatal(err)
@@ -375,7 +369,7 @@ func TestFSRemove(t *testing.T) {
 }
 
 func TestFSRemoveBadName(t *testing.T) {
-	withFS(t, func(fsys *FS) {
+	withFS(t, func(fsys *pgfs.FS) {
 		err := fsys.Remove("bad name")
 		if err != fs.ErrNotExist {
 			t.Fatal("expected fs.ErrNotExit. Got", err)
@@ -384,8 +378,8 @@ func TestFSRemoveBadName(t *testing.T) {
 }
 
 func TestFSStatNotExist(t *testing.T) {
-	withFS(t, func(fsys *FS) {
-		_, err := fsys.Stat(GenerateUUID())
+	withFS(t, func(fsys *pgfs.FS) {
+		_, err := fsys.Stat(pgfs.GenerateUUID())
 		if err != fs.ErrNotExist {
 			t.Fatal("expected fs.ErrNotExist")
 		}
@@ -393,8 +387,8 @@ func TestFSStatNotExist(t *testing.T) {
 }
 
 func TestFSCreate(t *testing.T) {
-	withFS(t, func(fsys *FS) {
-		name := GenerateUUID()
+	withFS(t, func(fsys *pgfs.FS) {
+		name := pgfs.GenerateUUID()
 		contentType := "application/pdf"
 		w, err := fsys.Create(name, contentType, nil)
 		if err != nil {
@@ -424,7 +418,7 @@ func TestFSCreate(t *testing.T) {
 	})
 }
 func TestFSCreateBadName(t *testing.T) {
-	withFS(t, func(fsys *FS) {
+	withFS(t, func(fsys *pgfs.FS) {
 		_, err := fsys.Create("bad name", "", nil)
 		if _, ok := err.(*fs.PathError); !ok {
 			t.Fatal("expected path error")
@@ -433,11 +427,11 @@ func TestFSCreateBadName(t *testing.T) {
 }
 
 func TestFSCreateFileExists(t *testing.T) {
-	withFS(t, func(fsys *FS) {
-		name := GenerateUUID()
-		createFile(t, fsys, name, BinaryType, nil)
+	withFS(t, func(fsys *pgfs.FS) {
+		name := pgfs.GenerateUUID()
+		createFile(t, fsys, name, pgfs.BinaryType, nil)
 
-		_, err := fsys.Create(name, BinaryType, nil)
+		_, err := fsys.Create(name, pgfs.BinaryType, nil)
 		if err != fs.ErrExist {
 			t.Fatal("expected fs.ErrExist. Got", err)
 		}
@@ -477,13 +471,13 @@ func (r *loopingReader) Read(p []byte) (n int, err error) {
 // computing another hash that can be compared
 // with the first one.
 func TestFSCreateLargeFile(t *testing.T) {
-	withFS(t, func(fsys *FS) {
+	withFS(t, func(fsys *pgfs.FS) {
 		var (
-			name = GenerateUUID()
+			name = pgfs.GenerateUUID()
 			h    = sha256.New()
 		)
 
-		w, err := fsys.Create(name, BinaryType, nil)
+		w, err := fsys.Create(name, pgfs.BinaryType, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -525,8 +519,8 @@ func TestFSCreateLargeFile(t *testing.T) {
 }
 
 func TestFSCreateWriteClosedFile(t *testing.T) {
-	withFS(t, func(fsys *FS) {
-		w, err := fsys.Create(GenerateUUID(), BinaryType, nil)
+	withFS(t, func(fsys *pgfs.FS) {
+		w, err := fsys.Create(pgfs.GenerateUUID(), pgfs.BinaryType, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -540,15 +534,15 @@ func TestFSCreateWriteClosedFile(t *testing.T) {
 		if _, err := w.Write(TestBytes); err != fs.ErrClosed {
 			t.Fatal("expected fs.ErrClosed. Got:", err)
 		}
-		if err := w.Close(); err != fs.ErrClosed {
-			t.Fatal("expected fs.ErrClosed. Got:", err)
+		if err := w.Close(); err != nil {
+			t.Fatal("expected nil. Got:", err)
 		}
 	})
 }
 
 func TestFSCreateEmptyContentType(t *testing.T) {
-	withFS(t, func(fsys *FS) {
-		name := GenerateUUID()
+	withFS(t, func(fsys *pgfs.FS) {
+		name := pgfs.GenerateUUID()
 		w, err := fsys.Create(name, "", nil)
 		if err != nil {
 			t.Fatal(err)
@@ -560,41 +554,36 @@ func TestFSCreateEmptyContentType(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		writer := w.(*writer)
-		if len(writer.tag) > 512 {
-			t.Fatal("tag is bigger than expected")
+		const wanted = "image/png"
+
+		info, err := fsys.Stat(name)
+		if err != nil {
+			t.Fatal(err)
 		}
 
-		got := writer.contentType
-		if wanted := "image/png"; wanted != got {
+		got := info.(pgfs.FileInfo).ContentType()
+		if wanted != got {
 			t.Fatal("Wanted:", wanted, "Got:", got)
 		}
 	})
 }
 
 func TestHTTPHandler(t *testing.T) {
-	withFS(t, func(fsys *FS) {
-		name := GenerateUUID()
+	withFS(t, func(fsys *pgfs.FS) {
+		name := pgfs.GenerateUUID()
 		createFile(t, fsys, name, "application/png", nil)
 
-		var (
-			f    *file
-			info FileInfo
-		)
-		{
-			ff, err := fsys.Open(name)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer ff.Close()
-			f = ff.(*file)
-
-			fi, err := f.Stat()
-			if err != nil {
-				t.Fatal(err)
-			}
-			info = fi.(FileInfo)
+		f, err := fsys.Open(name)
+		if err != nil {
+			t.Fatal(err)
 		}
+		defer f.Close()
+
+		fi, err := f.Stat()
+		if err != nil {
+			t.Fatal(err)
+		}
+		info := fi.(pgfs.FileInfo)
 
 		assertFn := func(t *testing.T, resp *http.Response) {
 			tests := map[string]string{
@@ -611,18 +600,10 @@ func TestHTTPHandler(t *testing.T) {
 			}
 		}
 
-		t.Run("File HTTP handler", func(t *testing.T) {
-			r := httptest.NewRequest(http.MethodGet, "https://example.com", nil)
-			w := httptest.NewRecorder()
-			f.ServeHTTP(w, r)
-			resp := w.Result()
-			assertFn(t, resp)
-		})
-
 		t.Run("Serve File handler", func(t *testing.T) {
 			r := httptest.NewRequest(http.MethodGet, "https://example.com", nil)
 			w := httptest.NewRecorder()
-			ServeFile(w, r, f)
+			pgfs.ServeFile(w, r, f)
 			resp := w.Result()
 			assertFn(t, resp)
 		})
@@ -640,18 +621,23 @@ func TestServeFile(t *testing.T) {
 
 	r := httptest.NewRequest(http.MethodGet, "https://example.com", nil)
 	w := httptest.NewRecorder()
-	ServeFile(w, r, f)
+	pgfs.ServeFile(w, r, f)
 	resp := w.Result()
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatal(resp.StatusCode)
 	}
+
+	const wanted = "image/png"
+	if got := resp.Header.Get("Content-Type"); got != wanted {
+		t.Fatal("Content-Type Wanted:", wanted, "Got:", got)
+	}
 }
 
 func TestOpenRoot(t *testing.T) {
-	withFS(t, func(fsys *FS) {
+	withFS(t, func(fsys *pgfs.FS) {
 		for i := 0; i < 100; i++ {
-			createFile(t, fsys, GenerateUUID(), BinaryType, nil)
+			createFile(t, fsys, pgfs.GenerateUUID(), pgfs.BinaryType, nil)
 		}
 
 		d, err := fsys.Open("")
@@ -677,7 +663,7 @@ func TestOpenRoot(t *testing.T) {
 			t.Error("invalid mod time")
 		}
 
-		if wanted := 100 * len(TestBytes); info.Size() <= int64(wanted) {
+		if wanted := 100 * len(TestBytes); info.Size() < int64(wanted) {
 			t.Error("size is lower than expected", "Got", info.Size(), "Wanted >=", wanted)
 		}
 	})
@@ -691,7 +677,7 @@ func TestOpenRoot(t *testing.T) {
 // it means that all the files available
 // were returned.
 func TestRootReadDir(t *testing.T) {
-	withFS(t, func(fsys *FS) {
+	withFS(t, func(fsys *pgfs.FS) {
 		root, err := fsys.Open("")
 		if err != nil {
 			t.Fatal(err)
@@ -703,7 +689,7 @@ func TestRootReadDir(t *testing.T) {
 		}
 
 		for i := 0; i < 20; i++ {
-			createFile(t, fsys, GenerateUUID(), BinaryType, nil)
+			createFile(t, fsys, pgfs.GenerateUUID(), pgfs.BinaryType, nil)
 		}
 
 		all := make([]fs.DirEntry, 0)
@@ -734,10 +720,45 @@ func TestRootReadDir(t *testing.T) {
 	})
 }
 
+func TestRootReadDirAll(t *testing.T) {
+	withFS(t, func(fsys *pgfs.FS) {
+		root, err := fsys.Open("")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		r, ok := root.(fs.ReadDirFile)
+		if !ok {
+			t.Fatal("root does not implement fs.ReadDirFile")
+		}
+
+		wanted := make([]string, 0, 13)
+		for i := 0; i < cap(wanted); i++ {
+			id := pgfs.GenerateUUID()
+			createFile(t, fsys, id, pgfs.BinaryType, nil)
+			wanted = append(wanted, id)
+		}
+
+		entries, err := r.ReadDir(-1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) != len(wanted) {
+			t.Fatal("Expected", len(wanted), " items. Got:", len(entries))
+		}
+
+		for i, e := range entries {
+			if e.Name() != wanted[i] {
+				t.Fatal("item mismatch. Index:", i, "Wanted:", wanted[i], "Got:", e.Name())
+			}
+		}
+	})
+}
+
 func TestWalkFunc(t *testing.T) {
-	withFS(t, func(fsys *FS) {
+	withFS(t, func(fsys *pgfs.FS) {
 		for i := 0; i < 100; i++ {
-			createFile(t, fsys, GenerateUUID(), BinaryType, nil)
+			createFile(t, fsys, pgfs.GenerateUUID(), pgfs.BinaryType, nil)
 		}
 
 		seen := 0

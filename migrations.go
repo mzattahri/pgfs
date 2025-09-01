@@ -31,6 +31,6 @@ func MigrateUp(conn Tx) error {
 
 // MigrateDown executes the SQL query in [Down].
 func MigrateDown(conn Tx) error {
-	_, err := conn.Exec(Up)
+	_, err := conn.Exec(Down)
 	return err
 }

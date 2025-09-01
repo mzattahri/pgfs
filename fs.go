@@ -64,9 +64,11 @@ package pgfs
 import (
 	"crypto/sha256"
 	"database/sql"
+	"errors"
+	"fmt"
 	"io"
 	"io/fs"
-	"log"
+	"log/slog"
 	"net/http"
 
 	"github.com/google/uuid"
@@ -134,16 +136,19 @@ func (fsys *FS) ReadFile(name string) ([]byte, error) {
 }
 
 // ReadDir implements [fs.ReadDirFS].
-//
-// An error is returned if name is not an empty string.
+// [fs.ErrNotExist] is returned if name is not an empty string.
 func (fsys *FS) ReadDir(name string) ([]fs.DirEntry, error) {
+	if name != "" {
+		return nil, fs.ErrNotExist
+	}
+
 	const q = `
 	  SELECT 
 			id, oid, created_at,
 			sys, content_size, content_type,
 			content_sha256
 	  FROM pgfs_metadata
-	  ORDER BY id ASC
+	  ORDER BY created_at ASC
 	`
 	rows, err := fsys.conn.Query(q)
 	if err != nil {
@@ -173,16 +178,10 @@ func (fsys *FS) ReadDir(name string) ([]fs.DirEntry, error) {
 
 func (fsys *FS) rootInfo() (fs.FileInfo, error) {
 	const q = `
-		WITH agg AS (
-			SELECT SUM(content_size) AS content_size
-			FROM pgfs_metadata
-		)
 		SELECT 
-			COALESCE(created_at, NOW()) as created_at, 
-			COALESCE((SELECT content_size FROM agg), 0) as content_size 
+			COALESCE(MAX(created_at), NOW()) as created_at, 
+			COALESCE(SUM(content_size), 0) as content_size 
 		FROM pgfs_metadata
-		ORDER BY created_at DESC
-		LIMIT 1
 	`
 	fi := &entry{
 		id:   rootUUID,
@@ -325,6 +324,34 @@ var (
 	_ fs.ReadDirFS = &FS{}
 )
 
+// detectContentType detects the content type of a seekable source by reading
+// the first 512 bytes. The seeking position is restored before the function exits.
+func detectContentType(src io.ReadSeeker) (string, error) {
+	// Save initial position
+	pos, err := src.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return "", fmt.Errorf("error seeking initial position: %w", err)
+	}
+
+	// Seek top
+	if _, err := src.Seek(0, io.SeekStart); err != nil {
+		return "", fmt.Errorf("error seeking top: %w", err)
+	}
+
+	tag := make([]byte, 512)
+	n, err := io.ReadFull(src, tag)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", fmt.Errorf("error reading from src: %w", err)
+	}
+
+	// Return to initial position
+	if _, err := src.Seek(pos, io.SeekStart); err != nil {
+		return "", fmt.Errorf("error returning to initial position: %w", err)
+	}
+
+	return http.DetectContentType(tag[:n]), nil
+}
+
 // ServeFile serves the content of a file over HTTP.
 //
 // If f is a file created by this package, [http.ServeContent]
@@ -345,23 +372,31 @@ func ServeFile(w http.ResponseWriter, r *http.Request, f fs.File) {
 
 	info, err := f.Stat()
 	if err != nil {
-		log.Printf("error reading file stat: %v", err)
+		slog.ErrorContext(r.Context(), "error reading file stat", "err", err)
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		return
 	}
 	if info.IsDir() {
-		log.Printf("error serving directory")
+		slog.ErrorContext(r.Context(), "error serving directory")
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		return
 	}
 
 	if rsc, ok := f.(io.ReadSeekCloser); ok {
+		cty, err := detectContentType(rsc)
+		if err != nil {
+			slog.ErrorContext(r.Context(), "error detecting content type", "err", err)
+			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", cty)
 		http.ServeContent(w, r, info.Name(), info.ModTime(), rsc)
 		return
 	}
 
 	w.Header().Set("Last-Modified", info.ModTime().Format(http.TimeFormat))
+	w.Header().Set("Content-Type", BinaryType)
 	if _, err := io.Copy(w, f); err != nil {
-		log.Printf("error copying file to response: %v", err)
+		slog.ErrorContext(r.Context(), "error copying file to response", "id", info.Name(), "err", err)
 	}
 }

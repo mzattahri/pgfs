@@ -1,6 +1,0 @@
-{
-  "cSpell.words": ["BYTEA", "loread", "lowrite", "lseek", "pgfs", "Repr"],
-  "go.testEnvVars": {
-    "POSTGRES_URL": "postgres://pgfs:password@localhost:5432/pgfs_test"
-  }
-}

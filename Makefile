@@ -9,30 +9,20 @@ COVERALLS_TOKEN?=$(shell cat COVERALLS_REPO_TOKEN)
 
 export
 
+.PHONY: all test db coverage vet
 
-# Start a Postgres container, run the tests, then exit.
-.PHONY: test
+all: test
+
 test:
 	@./testing/setup.sh go test ./...
 
-
-# Start a Postgres constainer.
-.PHONY: db
 db: DOCKER_IMAGE=postgres:$(POSTGRES_VERSION)-alpine
-db:
 	docker run --env POSTGRES_DB=$(POSTGRES_DB) --env POSTGRES_USER=$(POSTGRES_USER) --env POSTGRES_PASSWORD=$(POSTGRES_PASSWORD) --publish 5432:$(POSTGRES_PORT) $(DOCKER_IMAGE)
 
-
-# Send test coverage data to coveralls.
-.PHONY: coverage
 coverage:
 	@./testing/setup.sh goveralls
 
-
-# Vet the codebase.
-.PHONY: vet
 vet: coverage
 	go vet ./...
 	gosec --quiet ./...
 	govulncheck ./...
-	golint ./...

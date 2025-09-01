@@ -147,6 +147,21 @@ func close(conn Tx, fd int32) (err error) {
 	return
 }
 
+// unlink the lo file.
+func unlink(conn Tx, fd OID) (err error) {
+	const q = `SELECT lo_unlink($1)`
+
+	var result int
+	err = conn.QueryRow(q, fd).Scan(&result)
+	switch {
+	case err != nil:
+		break
+	case result == -1:
+		return errors.New("error unlinking large object")
+	}
+	return
+}
+
 // remove deletes the large object with the given
 // name, along with its metadata row.
 func remove(conn Tx, id uuid.UUID) (err error) {

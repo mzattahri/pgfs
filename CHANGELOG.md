@@ -1,5 +1,17 @@
 # CHANGE LOG
 
+## v2.0.0
+
+- Fixed issue with `ReadDir`/`Readdir` not handling case where n <= 0;
+- Fixed issue with `pgfs.ServeFile` not setting Content-Type when a generic `fs.File` is passed;
+- Fixed issue with `Sys.Scan`;
+- Fixed issue with dangling lo when `pgfs.Create` (INSERT) fails;
+- Fixed issue with `pgfs.MigrateDown` not using the correct query;
+- Modified file ordering to `created_at DESC`.
+- Upgraded logging to `slog`;
+- Upgraded dependencies;
+- Upgraded minimal Go version (1.23);
+
 ## v1.0.1
 
 - Upgraded dependencies;

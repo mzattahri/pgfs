@@ -28,8 +28,9 @@ func (sys *Sys) Scan(data any) error {
 	}
 
 	if sys == nil {
-		*sys = make(Sys)
+		return nil
 	}
+
 	b, ok := data.([]byte)
 	if !ok {
 		return fmt.Errorf("cannot cast data as []byte")
@@ -95,15 +96,12 @@ func (d *dir) Readdir(n int) (entries []fs.FileInfo, err error) {
 			id, oid, created_at, sys,
 			content_size, content_type, content_sha256
 	  FROM pgfs_metadata
-	  ORDER BY id ASC
-	  OFFSET $1 LIMIT $2
+	  ORDER BY created_at ASC
+	  OFFSET $1
+	  LIMIT CASE WHEN $2 <= 0 THEN NULL ELSE $2 END
 	`
 	var rows *sql.Rows
 	rows, err = d.fsys.conn.Query(q, d.cur, n)
-	if err == sql.ErrNoRows {
-		err = io.EOF
-		return
-	}
 	if err != nil {
 		return
 	}
@@ -122,10 +120,6 @@ func (d *dir) Readdir(n int) (entries []fs.FileInfo, err error) {
 			&e.contentType,
 			&e.contentSHA256,
 		)
-		if err == sql.ErrNoRows {
-			err = nil
-			break
-		}
 		if err != nil {
 			return
 		}
@@ -133,7 +127,7 @@ func (d *dir) Readdir(n int) (entries []fs.FileInfo, err error) {
 		d.cur++
 	}
 
-	if len(entries) < n {
+	if n > 0 && len(entries) < n {
 		err = io.EOF
 	}
 	return
@@ -180,12 +174,10 @@ func (e *entry) OID() OID                   { return e.oid }
 var _ FileInfo = &entry{}
 var _ fs.DirEntry = &entry{}
 
-// file implements [fs.File], [http.File],
-// [fs.ReadDirFile] and [http.Handler].
+// file implements [http.File] and [http.Handler].
 type file struct {
 	fsys   *FS
 	fd     int32
-	pos    int64
 	info   *entry
 	closed bool
 }
@@ -200,31 +192,39 @@ func (f *file) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (f *file) Stat() (fs.FileInfo, error) {
-	return f.fsys.Stat(f.info.id.String())
+	if f.closed {
+		return nil, fs.ErrClosed
+	}
+	return f.info, nil
 }
 
 func (f *file) Read(p []byte) (int, error) {
+	if f.closed {
+		return 0, fs.ErrClosed
+	}
 	return read(f.fsys.conn, f.fd, p)
 }
 
 func (f *file) Seek(offset int64, whence int) (n int64, err error) {
+	if f.closed {
+		return 0, fs.ErrClosed
+	}
+
 	n, err = seek(f.fsys.conn, f.fd, offset, whence)
 	if err != nil {
 		return
 	}
-	f.pos = n
 	return
 }
 
 func (f *file) Close() error {
 	if f.closed {
-		return fs.ErrClosed
+		return nil
 	}
-	err := close(f.fsys.conn, f.fd)
-	if err != nil {
+	defer func() {
 		f.closed = true
-	}
-	return err
+	}()
+	return close(f.fsys.conn, f.fd)
 }
 
 var _ fs.File = &file{}
