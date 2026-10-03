@@ -170,12 +170,16 @@ func (fsys *FS) rootInfo() (*entry, error) {
 
 // ReadFile reads the named file and returns its contents.
 // It implements [fs.ReadFileFS].
-func (fsys *FS) ReadFile(name string) ([]byte, error) {
+func (fsys *FS) ReadFile(name string) (data []byte, err error) {
 	f, err := fsys.Open(name)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() {
+		if cerr := f.Close(); err == nil && cerr != nil {
+			data, err = nil, cerr
+		}
+	}()
 
 	info, err := f.Stat()
 	if err != nil {
@@ -185,7 +189,7 @@ func (fsys *FS) ReadFile(name string) ([]byte, error) {
 		return nil, &fs.PathError{Op: "read", Path: name, Err: fs.ErrInvalid}
 	}
 
-	data := make([]byte, info.Size())
+	data = make([]byte, info.Size())
 	if _, err := io.ReadFull(f, data); err != nil {
 		return nil, err
 	}
@@ -233,7 +237,8 @@ func (fsys *FS) list(after *uuid.UUID, n int) ([]*entry, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	// Errors that matter are reported by rows.Err.
+	defer func() { _ = rows.Close() }()
 
 	var entries []*entry
 	for rows.Next() {
@@ -347,5 +352,6 @@ func ServeFile(w http.ResponseWriter, r *http.Request, f fs.File) {
 	if t := info.ModTime(); !t.IsZero() {
 		h.Set("Last-Modified", t.UTC().Format(http.TimeFormat))
 	}
-	io.Copy(w, f)
+	// The response has started, so errors cannot be reported.
+	_, _ = io.Copy(w, f)
 }
