@@ -3,84 +3,65 @@ package pgfs
 import (
 	"hash"
 	"io/fs"
-	"log/slog"
-	"math"
 	"net/http"
 
-	"github.com/google/uuid"
+	"uuid"
 )
 
-// writer writes data in a large object,
-// and inserts a row in the metadata table
-// when closed.
+// sniffLen is the number of bytes used by [http.DetectContentType].
+const sniffLen = 512
+
+// writer writes the content of a new file to its large object,
+// and records the file in the metadata table when closed.
 type writer struct {
+	fsys        *FS
 	fd          int32
 	oid         OID
 	id          uuid.UUID
 	sys         Sys
 	contentType string
 	size        int64
-	hasher      hash.Hash
-	fsys        *FS
+	hash        hash.Hash
+	head        []byte // first bytes written, to detect the content type
 	closed      bool
-	tag         []byte // holds the first 512 bytes
 }
 
-// Write implements [io.WriteCloser].
-func (w *writer) Write(b []byte) (n int, err error) {
+func (w *writer) Write(p []byte) (int, error) {
 	if w.closed {
-		err = fs.ErrClosed
-		return
+		return 0, w.error("write", fs.ErrClosed)
 	}
 
-	n, err = write(w.fsys.conn, w.fd, b)
+	n, err := w.fsys.loWrite(w.fd, p)
 	w.size += int64(n)
-	w.hasher.Write(b[:n])
-
-	// Store up to 512b for [http.DetectContentType].
-	if w.contentType == "" {
-		if m := 512 - len(w.tag); n > 0 && m > 0 {
-			i := int(math.Min(float64(n), float64(m)))
-			w.tag = append(w.tag, b[:i]...)
-		}
+	w.hash.Write(p[:n])
+	if w.contentType == "" && len(w.head) < sniffLen {
+		w.head = append(w.head, p[:min(n, sniffLen-len(w.head))]...)
 	}
-
-	return
+	return n, w.error("write", err)
 }
 
-// Close implements [io.WriteCloser].
 func (w *writer) Close() error {
 	if w.closed {
-		return nil
+		return w.error("close", fs.ErrClosed)
+	}
+	w.closed = true
+
+	if err := w.fsys.loClose(w.fd); err != nil {
+		return w.error("close", err)
 	}
 
-	defer func() {
-		if err := close(w.fsys.conn, w.fd); err != nil {
-			slog.Error("error closing lo", "id", w.id, "err", err)
-		}
-		w.closed = true
-	}()
-
 	if w.contentType == "" {
-		w.contentType = http.DetectContentType(w.tag)
+		w.contentType = http.DetectContentType(w.head)
 	}
 
 	const q = `
-	  INSERT INTO pgfs_metadata (
-			oid, id, sys,
-			content_size, content_type, content_sha256
-		) 
-		VALUES (
-			$1, $2, $3,
-			$4, $5, $6
-		)
-  `
-	_, err := w.fsys.conn.Exec(q, w.oid, w.id, w.sys, w.size, w.contentType, w.hasher.Sum(nil))
-	if err != nil {
-		if uerr := unlink(w.fsys.conn, w.oid); uerr != nil {
-			slog.Error("error unlinking lo after insert error", "id", w.id, "oid", w.oid, "err", uerr)
-		}
-		return err
-	}
-	return nil
+		INSERT INTO pgfs.metadata (oid, id, sys, content_size, content_type, content_sha256)
+		VALUES ($1, $2, $3, $4, $5, $6)
+	`
+	err := w.fsys.exec(q, w.oid, w.id, w.sys, w.size, w.contentType, w.hash.Sum(nil))
+	return w.error("close", err)
+}
+
+func (w *writer) error(op string, err error) error {
+	return pathError(op, w.id.String(), err)
 }

@@ -6,8 +6,9 @@ import (
 	"io"
 	"log"
 	"os"
+	"uuid"
 
-	"mz.attahri.com/code/pgfs/v2"
+	"mz.attahri.com/code/pgfs/v3"
 )
 
 var db *sql.DB
@@ -30,7 +31,7 @@ func ExampleFS_Create() {
 		"Credit":      "Renee French",
 		"Year":        "2009",
 	}
-	w, err := pgfs.New(tx).Create(pgfs.GenerateUUID(), "image/png", sys)
+	w, err := pgfs.New(tx).Create(uuid.New(), "image/png", sys)
 	if err != nil {
 		log.Fatal(err)
 	}

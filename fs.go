@@ -1,410 +1,351 @@
-// Package pgfs implements an [fs.FS]-compatible file system that reads and writes
-// files to Postgres as [Large Objects].
-//
-// # Large Objects
-//
-// On Postgres, [Large Objects] offer the ability to store files of any size up to
-// 4GB. While [BYTEA] columns are often easier to use and come with many benefits,
-// [Large Objects] allow content to be streamed and processed in chunks, just like
-// a regular local file. As such, they're a perfect fit for the interfaces of the
-// [io] and [fs] packages.
-//
-// # Structure
-//
-// [FS] is organized as a flat file system where files use UUID strings as names.
-//
-// Files are meant to be written once, and used as immutable read-only blobs
-// afterwards. They're tracked in a dedicated metadata table called "pgfs_metadata",
-// which can be created by calling [MigrateUp]. See [Up] for more information
-// on the schema used.
-//
-// While Postgres does not currently support referential integrity for [Large Objects],
-// the "pgfs_metadata" table can be referenced by foreign keys to obtain
-// the same guarantees. To that effect, it is recommended to use a [deletion constraint]
-// ("ON DELETE") constraint in order to prevent a row referencing a file from being deleted
-// before it's been formally removed with [FS.Remove].
-//
-//	CREATE TABLE user_files (
-//		[...]
-//		file_id UUID NOT NULL,
-//		FOREIGN KEY (file_id) REFERENCES pgfs_metadata (id) ON DELETE RESTRICT,
-//		[...]
-//	);
-//
-// # Metadata
-//
-// Attributes that do not require referential integrity can be stored
-// with each file using the [Sys] map passed when [FS.Create] is called.
-//
-// It can later be accessed via the [FileInfo] interface, either using [FS.Stat] or
-// by opening the file.
-//
-//	info, err := fsys.Stat("d7f225c4-db00-4b9f-8ed3-82682ca4171c")
-//	if err != nil {
-//	   log.Fatal(err)
-//	}
-//	sys := info.Sys().(pgfs.Sys)
-//	log.Println(sys["someAttribute"])
-//
-// Because [Sys] is stored as a [JSONB] column, metadata can also be queried
-// directly from the "pgfs_metadata" table using the standard
-// [JSON operators] of Postgres.
-//
-//	SELECT sys ->> 'someAttribute' as 'someAttribute'
-//	FROM pgfs_metadata
-//	WHERE id = 'd7f225c4-db00-4b9f-8ed3-82682ca4171c'::uuid
-//
-// [Large Objects]: https://www.postgresql.org/docs/current/largeobjects.html
-// [BYTEA]: https://www.postgresql.org/docs/current/datatype-binary.html
-// [JSONB]: https://www.postgresql.org/docs/current/datatype-json.html
-// [JSON operators]: https://www.postgresql.org/docs/current/functions-json.html#FUNCTIONS-JSON-OP-TABLE
-// [deletion constraint]: https://www.postgresql.org/docs/current/ddl-constraints.html#DDL-CONSTRAINTS-FK
 package pgfs
 
 import (
 	"crypto/sha256"
 	"database/sql"
-	"errors"
+	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"io/fs"
-	"log/slog"
 	"net/http"
+	"sync"
 
-	"github.com/google/uuid"
+	"uuid"
 )
 
-// root is the UUID assigned to the virtual root
-// directory of the file system.
-const root = "00000000-0000-0000-0000-000000000000"
-
-var rootUUID = uuid.MustParse(root)
-
-// GenerateUUID returns a new random UUID string.
-func GenerateUUID() string {
-	return uuid.New().String()
-}
-
-// BinaryType is the generic MIME type for
-// binary content.
+// BinaryType is the MIME type of arbitrary binary data.
 const BinaryType = "application/octet-stream"
 
-// Tx represents a database transaction type, such as [sql.Tx].
+// Tx is the database transaction an [FS] operates in.
+// It is implemented by [*sql.Tx].
 type Tx interface {
+	Exec(query string, args ...any) (sql.Result, error)
 	Query(query string, args ...any) (*sql.Rows, error)
 	QueryRow(query string, args ...any) *sql.Row
-	Exec(query string, args ...any) (sql.Result, error)
-	Rollback() error
-	Commit() error
 }
 
 var _ Tx = &sql.Tx{}
 
-// ValidPath is analog to [fs.ValidPath], and checks
-// if name is a valid UUID.
+// ValidPath reports whether name is a valid name for an [FS]:
+// either ".", which names the root directory, or a UUID in
+// a form accepted by [uuid.Parse].
 func ValidPath(name string) bool {
-	if name == "" { // root directory
+	if name == "." {
 		return true
 	}
 	_, err := uuid.Parse(name)
 	return err == nil
 }
 
-// FS implements a file system using the Large Objects API
-// of Postgres.
+// An FS is a file system that stores files as large objects
+// in a PostgreSQL database. It must be created with [New].
 //
-// FS implements [fs.StatFS] and [fs.ReadDirFS].
+// An FS is safe for concurrent use by multiple goroutines.
+// Since a transaction runs one query at a time, so does an FS:
+// concurrent operations wait for each other.
 type FS struct {
-	conn Tx
+	mu sync.Mutex // serializes queries
+	tx Tx
 }
 
-// New returns a new instance of [FS] bound to
-// a database transaction.
-func New(conn Tx) *FS {
-	return &FS{conn: conn}
+// New returns an [FS] that operates in tx.
+//
+// The FS can be used only until tx is committed or rolled back.
+func New(tx Tx) *FS {
+	return &FS{tx: tx}
 }
 
-// ReadFile returns the content of the file with the
-// given name.
+// queryRow runs a query that returns a single row,
+// and copies its columns into dest.
+func (fsys *FS) queryRow(query string, args []any, dest ...any) error {
+	fsys.mu.Lock()
+	defer fsys.mu.Unlock()
+	return fsys.tx.QueryRow(query, args...).Scan(dest...)
+}
+
+// exec runs a query that returns no rows.
+func (fsys *FS) exec(query string, args ...any) error {
+	fsys.mu.Lock()
+	defer fsys.mu.Unlock()
+	_, err := fsys.tx.Exec(query, args...)
+	return err
+}
+
+// parse returns the UUID named by name, or an
+// error matching [fs.ErrNotExist] if name is not one.
+func parse(op, name string) (uuid.UUID, error) {
+	id, err := uuid.Parse(name)
+	if err != nil {
+		return id, &fs.PathError{Op: op, Path: name, Err: fs.ErrNotExist}
+	}
+	return id, nil
+}
+
+// pathError wraps err in an [fs.PathError],
+// unless it is nil or [io.EOF].
+func pathError(op, name string, err error) error {
+	if err == nil || err == io.EOF {
+		return err
+	}
+	return &fs.PathError{Op: op, Path: name, Err: err}
+}
+
+// Open opens the named file for reading. It implements [fs.FS].
+//
+// The returned file also implements [io.Seeker] and [io.ReaderAt].
+// If name is ".", Open returns the root directory,
+// which implements [fs.ReadDirFile] and [http.File].
+func (fsys *FS) Open(name string) (fs.File, error) {
+	if name == "." {
+		info, err := fsys.rootInfo()
+		if err != nil {
+			return nil, pathError("open", name, err)
+		}
+		return &dir{fsys: fsys, info: info}, nil
+	}
+
+	id, err := parse("open", name)
+	if err != nil {
+		return nil, err
+	}
+	info, fd, err := fsys.open(id, invRead)
+	if err != nil {
+		return nil, pathError("open", name, err)
+	}
+	return &file{fsys: fsys, fd: fd, info: info}, nil
+}
+
+// Stat returns an [fs.FileInfo] describing the named file.
+// It implements [fs.StatFS].
+//
+// The returned value also implements [FileInfo]. If name is ".",
+// it describes the root directory: its size is the total size of
+// all files, and its modification time is the creation time of
+// the most recent one.
+func (fsys *FS) Stat(name string) (fs.FileInfo, error) {
+	if name == "." {
+		info, err := fsys.rootInfo()
+		if err != nil {
+			return nil, pathError("stat", name, err)
+		}
+		return info, nil
+	}
+
+	id, err := parse("stat", name)
+	if err != nil {
+		return nil, err
+	}
+
+	const q = `
+		SELECT oid, created_at, sys, content_size, content_type, content_sha256
+		FROM pgfs.metadata
+		WHERE id = $1
+	`
+	e := &entry{id: id}
+	err = fsys.queryRow(q, []any{id},
+		&e.oid, &e.createdAt, &e.sys, &e.contentSize, &e.contentType, &e.contentSHA256,
+	)
+	if err == sql.ErrNoRows {
+		err = fs.ErrNotExist
+	}
+	if err != nil {
+		return nil, pathError("stat", name, err)
+	}
+	return e, nil
+}
+
+func (fsys *FS) rootInfo() (*entry, error) {
+	const q = `
+		SELECT COALESCE(MAX(created_at), NOW()), COALESCE(SUM(content_size), 0)
+		FROM pgfs.metadata
+	`
+	e := &entry{mode: fs.ModeDir}
+	err := fsys.queryRow(q, nil, &e.createdAt, &e.contentSize)
+	if err != nil {
+		return nil, err
+	}
+	return e, nil
+}
+
+// ReadFile reads the named file and returns its contents.
+// It implements [fs.ReadFileFS].
 func (fsys *FS) ReadFile(name string) ([]byte, error) {
 	f, err := fsys.Open(name)
 	if err != nil {
 		return nil, err
 	}
-	defer func() {
-		if err := f.Close(); err != nil {
-			slog.Error("error closing file", "name", name, "err", err)
-		}
-	}()
-	return io.ReadAll(f)
-}
+	defer f.Close()
 
-// ReadDir implements [fs.ReadDirFS].
-// [fs.ErrNotExist] is returned if name is not an empty string.
-func (fsys *FS) ReadDir(name string) ([]fs.DirEntry, error) {
-	if name != "" {
-		return nil, fs.ErrNotExist
-	}
-
-	const q = `
-	  SELECT 
-			id, oid, created_at,
-			sys, content_size, content_type,
-			content_sha256
-	  FROM pgfs_metadata
-	  ORDER BY created_at ASC
-	`
-	rows, err := fsys.conn.Query(q)
+	info, err := f.Stat()
 	if err != nil {
 		return nil, err
 	}
+	if info.IsDir() {
+		return nil, &fs.PathError{Op: "read", Path: name, Err: fs.ErrInvalid}
+	}
 
-	entries := make([]fs.DirEntry, 0)
-	defer func() {
-		if err := rows.Close(); err != nil {
-			slog.Error("error closing rows", "dir", name, "err", err)
-		}
-	}()
+	data := make([]byte, info.Size())
+	if _, err := io.ReadFull(f, data); err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+// ReadDir reads the root directory and returns all its entries,
+// sorted by name. It implements [fs.ReadDirFS].
+//
+// Since the file system has no subdirectories, ReadDir returns
+// an error matching [fs.ErrNotExist] if name is not ".".
+func (fsys *FS) ReadDir(name string) ([]fs.DirEntry, error) {
+	if name != "." {
+		return nil, &fs.PathError{Op: "readdir", Path: name, Err: fs.ErrNotExist}
+	}
+	entries, err := fsys.list(nil, 0)
+	if err != nil {
+		return nil, pathError("readdir", name, err)
+	}
+	list := make([]fs.DirEntry, len(entries))
+	for i, e := range entries {
+		list[i] = e
+	}
+	return list, nil
+}
+
+// list returns up to n entries sorted by name, starting after
+// the entry named after. If after is nil, the list starts with
+// the first entry. If n <= 0, list returns all the entries.
+func (fsys *FS) list(after *uuid.UUID, n int) ([]*entry, error) {
+	const q = `
+		SELECT id, oid, created_at, sys, content_size, content_type, content_sha256
+		FROM pgfs.metadata
+		WHERE $1::uuid IS NULL OR id > $1::uuid
+		ORDER BY id
+		LIMIT CASE WHEN $2 <= 0 THEN NULL ELSE $2 END
+	`
+	var start any
+	if after != nil {
+		start = *after
+	}
+	fsys.mu.Lock()
+	defer fsys.mu.Unlock()
+	rows, err := fsys.tx.Query(q, start, n)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var entries []*entry
 	for rows.Next() {
 		e := &entry{}
 		err := rows.Scan(
-			&e.id,
-			&e.oid,
-			&e.createdAt,
-			&e.sys,
-			&e.contentSize,
-			&e.contentType,
-			&e.contentSHA256,
+			&e.id, &e.oid, &e.createdAt, &e.sys, &e.contentSize, &e.contentType, &e.contentSHA256,
 		)
 		if err != nil {
 			return nil, err
 		}
 		entries = append(entries, e)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	return entries, nil
 }
 
-func (fsys *FS) rootInfo() (fs.FileInfo, error) {
-	const q = `
-		SELECT 
-			COALESCE(MAX(created_at), NOW()) as created_at, 
-			COALESCE(SUM(content_size), 0) as content_size 
-		FROM pgfs_metadata
-	`
-	fi := &entry{
-		id:   rootUUID,
-		mode: fs.ModeDir,
-	}
-	err := fsys.conn.QueryRow(q).Scan(&fi.createdAt, &fi.contentSize)
-	if err != nil && err != sql.ErrNoRows {
-		return nil, err
-	}
-	return fi, nil
-}
-
-// Stat returns info on the file with the given name.
+// Create creates a new file named id and returns a writer
+// for its content. If a file named id already exists, Create
+// returns an error matching [fs.ErrExist].
 //
-// If name is an empty string, the returned info is on the
-// root directory.
+// The file is recorded when the writer is closed, so the caller
+// must call Close and check its error. Until then, the file does
+// not appear in the file system.
 //
-// The returned value implements [FileInfo].
-func (fsys *FS) Stat(name string) (fs.FileInfo, error) {
-	if name == "" {
-		return fsys.rootInfo()
-	}
-
-	id, err := uuid.Parse(name)
+// contentType is the MIME type of the content, such as
+// "application/pdf". If it is empty, the type is detected from
+// the first 512 bytes written using [http.DetectContentType].
+//
+// sys holds custom attributes stored with the file, and may be nil.
+// They are returned by [fs.FileInfo.Sys].
+func (fsys *FS) Create(id uuid.UUID, contentType string, sys Sys) (io.WriteCloser, error) {
+	oid, fd, err := fsys.create(id)
 	if err != nil {
-		return nil, fs.ErrNotExist
+		return nil, pathError("create", id.String(), err)
 	}
-
-	const q = `
-	  SELECT 
-			oid, created_at, sys,
-			content_size, content_type, content_sha256
-		FROM pgfs_metadata
-		WHERE id = $1
-	`
-	row := fsys.conn.QueryRow(q, id)
-	e := &entry{
-		id:   id,
-		mode: 0,
-	}
-	err = row.Scan(
-		&e.oid,
-		&e.createdAt,
-		&e.sys,
-		&e.contentSize,
-		&e.contentType,
-		&e.contentSHA256,
-	)
-	if err == sql.ErrNoRows {
-		err = fs.ErrNotExist
-	}
-	return e, err
-}
-
-// Open returns the file with the given name.
-//
-// If name is an empty string, the root directory
-// is returned.
-func (fsys *FS) Open(name string) (fs.File, error) {
-	if name == "" {
-		di, err := fsys.Stat("")
-		if err != nil {
-			return nil, err
-		}
-		return &dir{fsys: fsys, info: di.(*entry)}, nil
-	}
-
-	id, err := uuid.Parse(name)
-	if err != nil {
-		return nil, fs.ErrNotExist
-	}
-
-	info, fd, err := open(fsys.conn, id, invRead)
-	if err != nil {
-		return nil, err
-	}
-
-	f := &file{
-		fd:   fd,
-		fsys: fsys,
-		info: info,
-	}
-	return f, nil
-}
-
-// Create returns a writer to a new file with the given
-// name and content type. The caller must close the writer
-// for the operation to complete.
-//
-// The name must be a valid and unique UUID.
-//
-// The content type should be a valid MIME type, such as
-// "application/pdf" or "image/png". If an empty string is passed,
-// [http.DetectContentType] will be used to make a guess
-// from the first 512 bytes of data written.
-//
-// Custom metadata attributes can be passed and stored with the file
-// using sys. They can later be accessed using [fs.FileInfo.Sys]
-// by either opening the file or calling [FS.Stat].
-func (fsys *FS) Create(name, contentType string, sys map[string]string) (io.WriteCloser, error) {
-	id, err := uuid.Parse(name)
-	if err != nil {
-		pErr := &fs.PathError{
-			Op:   "create",
-			Path: name,
-			Err:  err,
-		}
-		return nil, pErr
-	}
-
-	oid, fd, err := create(fsys.conn, id)
-	if err != nil {
-		return nil, err
-	}
-
 	w := &writer{
+		fsys:        fsys,
 		fd:          fd,
 		oid:         oid,
-		fsys:        fsys,
-		hasher:      sha256.New(),
 		id:          id,
 		sys:         sys,
 		contentType: contentType,
+		hash:        sha256.New(),
 	}
 	return w, nil
 }
 
-// Remove deletes the file with the given name.
+// Remove removes the named file and its content.
+// If the file does not exist, Remove returns an error
+// matching [fs.ErrNotExist].
 func (fsys *FS) Remove(name string) error {
-	id, err := uuid.Parse(name)
+	id, err := parse("remove", name)
 	if err != nil {
-		return fs.ErrNotExist
+		return err
 	}
-
-	return remove(fsys.conn, id)
+	return pathError("remove", name, fsys.remove(id))
 }
 
 var (
-	_ fs.StatFS    = &FS{}
-	_ fs.ReadDirFS = &FS{}
+	_ fs.StatFS     = &FS{}
+	_ fs.ReadDirFS  = &FS{}
+	_ fs.ReadFileFS = &FS{}
 )
 
-// detectContentType detects the content type of a seekable source by reading
-// the first 512 bytes. The seeking position is restored before the function exits.
-func detectContentType(src io.ReadSeeker) (string, error) {
-	// Save initial position
-	pos, err := src.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return "", fmt.Errorf("error seeking initial position: %w", err)
-	}
-
-	// Seek top
-	if _, err := src.Seek(0, io.SeekStart); err != nil {
-		return "", fmt.Errorf("error seeking top: %w", err)
-	}
-
-	tag := make([]byte, 512)
-	n, err := io.ReadFull(src, tag)
-	if err != nil && !errors.Is(err, io.EOF) {
-		return "", fmt.Errorf("error reading from src: %w", err)
-	}
-
-	// Return to initial position
-	if _, err := src.Seek(pos, io.SeekStart); err != nil {
-		return "", fmt.Errorf("error returning to initial position: %w", err)
-	}
-
-	return http.DetectContentType(tag[:n]), nil
-}
-
-// ServeFile serves the content of a file over HTTP.
+// ServeFile replies to the request with the contents of f.
 //
-// If f is a file created by this package, [http.ServeContent]
-// is used after adding the appropriate headers sourced
-// from its [FileInfo].
+// If f was opened by an [FS], ServeFile sets the following headers
+// from the file's [FileInfo]:
 //
-//	[...]
-//	Content-Type: application/png                                             // FileInfo.ContentType()
-//	ETag: "0de648a9c8c19264e6cd6a441a867d0989a03929cacec442ad1f0cd192bc9072"  // FileInfo.ContentSHA256()
-//	Last-Modified: Thu, 22 Jun 2023 14:34:35 GMT                              // FileInfo.ModTime()
-//	Repr-Digest: sha-256=:DeZIqcjBkmTmzWpEGoZ9CYmgOSnKzsRCrR8M0ZK8kHI=:       // FileInfo.ContentSHA256()
-//	[...]
+//	Content-Type: image/png
+//	ETag: "0de648a9c8c19264e6cd6a441a867d0989a03929cacec442ad1f0cd192bc9072"
+//	Repr-Digest: sha-256=:DeZIqcjBkmTmzWpEGoZ9CYmgOSnKzsRCrR8M0ZK8kHI=:
+//
+// ETag and Repr-Digest are derived from the SHA-256 digest of the
+// content, which is computed when the file is created.
+//
+// If f implements [io.Seeker], as files opened by an FS do, it is
+// served with [http.ServeContent], which handles Range and conditional
+// requests, sets Last-Modified, and detects the content type if it is
+// not set. Otherwise, the content of f is copied to the response,
+// with [BinaryType] as its content type.
+//
+// If f is a directory, or if its information cannot be read,
+// ServeFile replies with a 500 Internal Server Error.
 func ServeFile(w http.ResponseWriter, r *http.Request, f fs.File) {
-	if handler, ok := f.(http.Handler); ok {
-		handler.ServeHTTP(w, r)
-		return
-	}
-
 	info, err := f.Stat()
-	if err != nil {
-		slog.ErrorContext(r.Context(), "error reading file stat", "err", err)
-		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-		return
-	}
-	if info.IsDir() {
-		slog.ErrorContext(r.Context(), "error serving directory")
-		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+	if err != nil || info.IsDir() {
+		code := http.StatusInternalServerError
+		http.Error(w, http.StatusText(code), code)
 		return
 	}
 
-	if rsc, ok := f.(io.ReadSeekCloser); ok {
-		cty, err := detectContentType(rsc)
-		if err != nil {
-			slog.ErrorContext(r.Context(), "error detecting content type", "err", err)
-			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", cty)
-		http.ServeContent(w, r, info.Name(), info.ModTime(), rsc)
+	h := w.Header()
+	if fi, ok := info.(FileInfo); ok {
+		sum := fi.ContentSHA256()
+		h.Set("Content-Type", fi.ContentType())
+		h.Set("ETag", fmt.Sprintf("%q", hex.EncodeToString(sum)))
+		h.Set("Repr-Digest", fmt.Sprintf("sha-256=:%s:", base64.StdEncoding.EncodeToString(sum)))
+	}
+
+	if rs, ok := f.(io.ReadSeeker); ok {
+		http.ServeContent(w, r, info.Name(), info.ModTime(), rs)
 		return
 	}
 
-	w.Header().Set("Last-Modified", info.ModTime().Format(http.TimeFormat))
-	w.Header().Set("Content-Type", BinaryType)
-	if _, err := io.Copy(w, f); err != nil {
-		slog.ErrorContext(r.Context(), "error copying file to response", "id", info.Name(), "err", err)
+	if h.Get("Content-Type") == "" {
+		h.Set("Content-Type", BinaryType)
 	}
+	if t := info.ModTime(); !t.IsZero() {
+		h.Set("Last-Modified", t.UTC().Format(http.TimeFormat))
+	}
+	io.Copy(w, f)
 }

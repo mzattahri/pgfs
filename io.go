@@ -2,188 +2,148 @@ package pgfs
 
 import (
 	"database/sql"
-	"errors"
-	"fmt"
 	"io"
 	"io/fs"
 
-	"github.com/google/uuid"
+	"uuid"
 )
 
-// file modes on Postgres.
+// Modes of large object descriptors, from libpq/libpq-fs.h.
 const (
 	invRead  = 0x00020000
 	invWrite = 0x00040000
 )
 
-// OID is the internal ID of a large object
-// on Postgres.
+// maxRead is the maximum number of bytes read from
+// a large object in a single query.
+const maxRead = 1 << 20
+
+// An OID is the object identifier PostgreSQL assigns to a large object.
 type OID uint32
 
-// open returns info and a file descriptor for an existing
-// large object.
-func open(conn Tx, id uuid.UUID, mode int) (info *entry, fd int32, err error) {
+// The functions below run the server-side large object functions.
+// These report failures as SQL errors, never as -1 like their
+// counterparts in libpq.
+
+// open opens the large object of the file named id,
+// and returns the file's metadata and descriptor.
+func (fsys *FS) open(id uuid.UUID, mode int) (*entry, int32, error) {
 	const q = `
-		SELECT 
-			oid, created_at,
-			content_size, content_type, content_sha256,
-			lo_open(oid, $2) as fd
-		FROM pgfs_metadata
+		SELECT oid, created_at, sys, content_size, content_type, content_sha256, lo_open(oid, $2)
+		FROM pgfs.metadata
 		WHERE id = $1
 	`
-	info = &entry{id: id}
-	err = conn.QueryRow(q, id, mode).Scan(
-		&info.oid,
-		&info.createdAt,
-		&info.contentSize,
-		&info.contentType,
-		&info.contentSHA256,
-		&fd,
+	e := &entry{id: id}
+	var fd int32
+	err := fsys.queryRow(q, []any{id, mode},
+		&e.oid, &e.createdAt, &e.sys, &e.contentSize, &e.contentType, &e.contentSHA256, &fd,
 	)
-	switch {
-	case err == sql.ErrNoRows:
+	if err == sql.ErrNoRows {
 		err = fs.ErrNotExist
-	case err != nil:
-		break
-	case fd == -1:
-		err = errors.New("error opening large object")
 	}
-	return
+	return e, fd, err
 }
 
-// create creates and opens a new large object for writing
-// if no other object with the same name exists in the metadata
-// table.
-func create(conn Tx, id uuid.UUID) (oid OID, fd int32, err error) {
+// create creates and opens a large object for a new file
+// named id, unless a file with that name already exists.
+func (fsys *FS) create(id uuid.UUID) (OID, int32, error) {
 	const q = `
-		WITH 
-			meta AS (
-				SELECT id
-				FROM pgfs_metadata
-				WHERE id = $1
-			),
-			lob AS (
-				SELECT lo_create(0) AS oid
-				WHERE NOT EXISTS (SELECT id FROM meta)
-			)
-		SELECT 
-			(SELECT oid FROM lob) as oid,
-			lo_open((SELECT oid FROM lob), $2) as fd
-		WHERE EXISTS (SELECT oid FROM lob)
+		WITH lob AS (
+			SELECT lo_create(0) AS oid
+			WHERE NOT EXISTS (SELECT 1 FROM pgfs.metadata WHERE id = $1)
+		)
+		SELECT oid, lo_open(oid, $2) FROM lob
 	`
-	err = conn.QueryRow(q, id, invRead|invWrite).Scan(&oid, &fd)
-	switch {
-	case err == sql.ErrNoRows:
+	var (
+		oid OID
+		fd  int32
+	)
+	err := fsys.queryRow(q, []any{id, invRead | invWrite}, &oid, &fd)
+	if err == sql.ErrNoRows {
 		err = fs.ErrExist
-	case err != nil:
-		break
-	case fd == -1:
-		err = fmt.Errorf("error creating large object")
 	}
-	return
+	return oid, fd, err
 }
 
-// write is analog to [io.Writer], and writes b
-// in the file fd.
-func write(conn Tx, fd int32, b []byte) (n int, err error) {
-	const q = `SELECT lowrite($1, $2)`
-
-	err = conn.QueryRow(q, fd, b).Scan(&n)
-	switch {
-	case err != nil:
-		break
-	case n < 0:
-		err = errors.New("error writing to large object")
-	case n < len(b):
-		err = io.ErrShortWrite
+// remove deletes the file named id, and its large object.
+func (fsys *FS) remove(id uuid.UUID) error {
+	const q = `
+		WITH meta AS (
+			DELETE FROM pgfs.metadata WHERE id = $1 RETURNING oid
+		)
+		SELECT lo_unlink(oid) FROM meta
+	`
+	var result int
+	err := fsys.queryRow(q, []any{id}, &result)
+	if err == sql.ErrNoRows {
+		err = fs.ErrNotExist
 	}
-	return
+	return err
 }
 
-// seek is analog to [io.Seeker], and changes the read/write
-// position in fd.
-func seek(conn Tx, fd int32, offset int64, whence int) (n int64, err error) {
-	const q = `SELECT lo_lseek64($1, $2, $3)`
-
-	err = conn.QueryRow(q, fd, offset, whence).Scan(&n)
-	switch {
-	case err != nil:
-		break
-	case n == -1:
-		err = errors.New("error seeking position in large object")
-	}
-	return
-}
-
-// read is analog to [io.Reader], and fills p with len(p)
-// bytes from the file fd.
-func read(conn Tx, fd int32, p []byte) (n int, err error) {
+// loRead reads up to len(p) bytes from the large object fd into p.
+// It returns io.EOF if it reads fewer bytes than requested.
+func (fsys *FS) loRead(fd int32, p []byte) (int, error) {
 	const q = `SELECT loread($1, $2)`
 
-	buf := make([]byte, 0, len(p))
-	err = conn.QueryRow(q, fd, len(p)).Scan(&buf)
-	if err != nil {
-		return
+	n := min(len(p), maxRead)
+	var buf []byte
+	if err := fsys.queryRow(q, []any{fd, n}, &buf); err != nil {
+		return 0, err
 	}
-	if len(p) != len(buf) {
-		err = io.EOF
+	m := copy(p, buf)
+	if m < n {
+		return m, io.EOF
 	}
-	n = copy(p, buf)
-	return
+	return m, nil
 }
 
-// close closes the file.
-func close(conn Tx, fd int32) (err error) {
+// loGet reads up to len(p) bytes from the large object oid,
+// starting at offset off, into p. Unlike loRead, it does not use
+// a descriptor, and does not change its offset.
+// It returns io.EOF if it reads fewer bytes than requested.
+func (fsys *FS) loGet(oid OID, off int64, p []byte) (int, error) {
+	const q = `SELECT lo_get($1, $2, $3)`
+
+	n := min(len(p), maxRead)
+	var buf []byte
+	if err := fsys.queryRow(q, []any{oid, off, n}, &buf); err != nil {
+		return 0, err
+	}
+	m := copy(p, buf)
+	if m < n {
+		return m, io.EOF
+	}
+	return m, nil
+}
+
+// loWrite writes p to the large object fd.
+func (fsys *FS) loWrite(fd int32, p []byte) (int, error) {
+	const q = `SELECT lowrite($1, $2)`
+
+	var n int
+	if err := fsys.queryRow(q, []any{fd, p}, &n); err != nil {
+		return 0, err
+	}
+	if n < len(p) {
+		return n, io.ErrShortWrite
+	}
+	return n, nil
+}
+
+// loSeek sets the offset of the large object fd, as [io.Seeker] does.
+func (fsys *FS) loSeek(fd int32, offset int64, whence int) (int64, error) {
+	const q = `SELECT lo_lseek64($1, $2, $3)`
+
+	var n int64
+	err := fsys.queryRow(q, []any{fd, offset, whence}, &n)
+	return n, err
+}
+
+// loClose closes the large object descriptor fd.
+func (fsys *FS) loClose(fd int32) error {
 	const q = `SELECT lo_close($1)`
 
 	var result int
-	err = conn.QueryRow(q, fd).Scan(&result)
-	switch {
-	case err != nil:
-		break
-	case result == -1:
-		return errors.New("error closing large object")
-	}
-	return
-}
-
-// unlink the lo file.
-func unlink(conn Tx, fd OID) (err error) {
-	const q = `SELECT lo_unlink($1)`
-
-	var result int
-	err = conn.QueryRow(q, fd).Scan(&result)
-	switch {
-	case err != nil:
-		break
-	case result == -1:
-		return errors.New("error unlinking large object")
-	}
-	return
-}
-
-// remove deletes the large object with the given
-// name, along with its metadata row.
-func remove(conn Tx, id uuid.UUID) (err error) {
-	const q = `
-		WITH meta AS (
-			DELETE FROM pgfs_metadata
-			WHERE id = $1
-			RETURNING oid
-		)
-		SELECT lo_unlink((SELECT oid FROM meta))
-		WHERE EXISTS(SELECT oid FROM meta)
-	`
-
-	var result int
-	err = conn.QueryRow(q, id).Scan(&result)
-	switch {
-	case err == sql.ErrNoRows:
-		err = fs.ErrNotExist
-	case err != nil:
-		break
-	case result == -1:
-		err = errors.New("error deleting large object")
-	}
-	return
+	return fsys.queryRow(q, []any{fd}, &result)
 }
